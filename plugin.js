@@ -5,12 +5,16 @@ penpot.ui.open("DeepSeek Design Copilot", "?theme=" + encodeURIComponent(penpot.
 
 penpot.ui.onMessage(async (event) => {
   const message = event.message;
+  if (message?.type === "plugin_ready") {
+    sendSelectionUpdate();
+    return;
+  }
   if (message?.type === "read_selection") {
     try {
       const budget = { remaining: 200 };
-      penpot.ui.sendMessage({ type: "selection_result", selection: penpot.selection.slice(0, 20).map((shape) => serializeShape(shape, 0, budget)) });
+      penpot.ui.sendMessage({ type: "selection_result", requestId: message.requestId, selection: getSelection(budget) });
     } catch (error) {
-      penpot.ui.sendMessage({ type: "selection_result", error: error instanceof Error ? error.message : String(error) });
+      penpot.ui.sendMessage({ type: "selection_result", requestId: message.requestId, error: error instanceof Error ? error.message : String(error) });
     }
     return;
   }
@@ -31,6 +35,20 @@ penpot.ui.onMessage(async (event) => {
     });
   }
 });
+
+penpot.on("selectionchange", () => sendSelectionUpdate());
+
+function getSelection(budget = { remaining: 200 }) {
+  return penpot.selection.slice(0, 20).map((shape) => serializeShape(shape, 0, budget));
+}
+
+function sendSelectionUpdate() {
+  try {
+    penpot.ui.sendMessage({ type: "selection_update", selection: getSelection() });
+  } catch (error) {
+    penpot.ui.sendMessage({ type: "selection_update", error: error instanceof Error ? error.message : String(error) });
+  }
+}
 
 function serializeShape(shape, depth = 0, budget = { remaining: 200 }) {
   if (depth >= 8 || budget.remaining <= 0) return { type: shape.type, name: shape.name, truncated: true };
@@ -82,14 +100,18 @@ async function createNode(spec, parent) {
   }
   if (spec.name) node.name = String(spec.name);
 
-  if (spec.fills) node.fills = await convertFills(spec.fills);
+  if (spec.fills !== undefined) node.fills = await convertFills(spec.fills);
   if (Array.isArray(spec.strokes)) {
-    node.strokes = spec.strokes.map((stroke) => ({
-      strokeColor: toHex(stroke.color),
-      strokeOpacity: clamp(stroke.opacity, 0, 1, 1),
-      strokeStyle: "solid",
-      strokeWidth: Math.max(0, Number(spec.strokeWeight) || 1),
-    }));
+    node.strokes = spec.strokes.map((stroke) => {
+      const color = stroke.color ?? stroke.strokeColor;
+      return {
+        strokeColor: toHex(color),
+        strokeOpacity: clamp(Number(stroke.opacity ?? stroke.strokeOpacity), 0, 1, 1),
+        strokeStyle: stroke.strokeStyle || "solid",
+        strokeWidth: Math.max(0, Number(stroke.strokeWidth ?? spec.strokeWeight) || 1),
+        strokeAlignment: stroke.strokeAlignment || "center",
+      };
+    });
   }
   if (Array.isArray(spec.effects)) {
     node.shadows = spec.effects
@@ -101,15 +123,23 @@ async function createNode(spec, parent) {
         spread: Number(effect.spread_radius) || 0,
         blur: Math.max(0, Number(effect.blur_radius) || 0),
         hidden: false,
-        color: toHex(effect.color),
+        color: {
+          color: toHex(effect.color),
+          opacity: clamp(Number(effect.opacity ?? effect.color?.opacity), 0, 1, 1),
+        },
       }));
   }
+  if (Number.isFinite(spec.opacity)) node.opacity = clamp(spec.opacity, 0, 1, 1);
   applySharedProperties(spec, node);
 
   if (parent) parent.appendChild(node);
 
   if (node.type === "text") {
     if (Number.isFinite(spec.fontSize)) node.fontSize = String(spec.fontSize);
+    if (spec.fontFamily) node.fontFamily = String(spec.fontFamily);
+    if (spec.fontWeight !== undefined) node.fontWeight = String(spec.fontWeight);
+    if (spec.fontStyle === "italic" || spec.fontStyle === "normal") node.fontStyle = spec.fontStyle;
+    if (Number.isFinite(spec.lineHeight)) node.lineHeight = String(spec.lineHeight);
     if (Number.isFinite(spec.letterSpacing)) node.letterSpacing = String(spec.letterSpacing);
     if (spec.textAlignHorizontal) {
       const align = {
@@ -133,15 +163,20 @@ async function createNode(spec, parent) {
 }
 
 async function convertFills(fills) {
-  if (!Array.isArray(fills) || fills.length === 0) return [{ fillOpacity: 0 }];
+  if (fills == null || (Array.isArray(fills) && fills.length === 0)) return [{ fillOpacity: 0 }];
+  if (!Array.isArray(fills)) fills = [fills];
   return Promise.all(fills.map(async (fill) => {
-    if (fill.type === "SOLID") {
-      return { fillColor: toHex(fill.color), fillOpacity: clamp(fill.opacity, 0, 1, 1) };
+    const type = String(fill.type || "").toUpperCase();
+    if (type === "SOLID" || (!type && (fill.color !== undefined || fill.fillColor !== undefined))) {
+      return {
+        fillColor: toHex(fill.color ?? fill.fillColor),
+        fillOpacity: clamp(Number(fill.opacity ?? fill.fillOpacity), 0, 1, 1),
+      };
     }
-    if (fill.type === "IMAGE" && typeof fill.url === "string" && fill.url) {
+    if (type === "IMAGE" && typeof fill.url === "string" && fill.url) {
       return { fillOpacity: 1, fillImage: await penpot.uploadMediaUrl("IMAGE", fill.url) };
     }
-    return { fillColor: "#000000", fillOpacity: 1 };
+    throw new Error(`无法写入填充样式：不支持的填充类型 ${fill.type || "（缺少颜色）"}。`);
   }));
 }
 
@@ -162,9 +197,39 @@ function applySharedProperties(spec, node) {
 }
 
 function toHex(color) {
-  if (!color) return "#000000";
-  const channel = (value) => Math.round(clamp(Number(value), 0, 255, 0)).toString(16).padStart(2, "0");
-  return "#" + channel(color.r) + channel(color.g) + channel(color.b);
+  if (typeof color === "string") {
+    const value = color.trim();
+    const shortHex = value.match(/^#([\da-f]{3})$/i);
+    if (shortHex) return "#" + [...shortHex[1]].map((part) => part + part).join("").toUpperCase();
+    const hex = value.match(/^#([\da-f]{6})(?:[\da-f]{2})?$/i);
+    if (hex) return `#${hex[1].toUpperCase()}`;
+    const rgb = value.match(/^rgba?\(([^)]+)\)$/i);
+    if (rgb) {
+      const channels = rgb[1].split(/[\s,\/]+/).filter(Boolean).slice(0, 3).map((part) => {
+        const percent = part.endsWith("%");
+        const number = Number.parseFloat(part);
+        return percent ? number * 2.55 : number;
+      });
+      if (channels.length === 3 && channels.every(Number.isFinite)) return channelsToHex(...channels);
+    }
+    throw new Error(`无法识别颜色值：${color}`);
+  }
+  if (color && typeof color === "object") {
+    const channels = [color.r ?? color.red, color.g ?? color.green, color.b ?? color.blue].map(Number);
+    if (channels.every(Number.isFinite)) {
+      const normalized = channels.every((channel) => channel >= 0 && channel <= 1)
+        ? channels.map((channel) => channel * 255)
+        : channels;
+      return channelsToHex(...normalized);
+    }
+    if (typeof color.color === "string") return toHex(color.color);
+  }
+  throw new Error("无法识别颜色值：需要 HEX、RGB 或 RGB 对象。");
+}
+
+function channelsToHex(red, green, blue) {
+  const channel = (value) => Math.round(clamp(value, 0, 255, 0)).toString(16).padStart(2, "0");
+  return `#${channel(red)}${channel(green)}${channel(blue)}`.toUpperCase();
 }
 
 function clamp(value, min, max, fallback) {

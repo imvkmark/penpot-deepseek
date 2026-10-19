@@ -67,7 +67,7 @@
       const activeSessionKey = "penpot-deepseek-active-session-v1";
       const keyStorageKey = "penpot-deepseek-api-key";
       let sessions = loadSessions();
-      let selectedContext = "";
+      let pendingSubmission = null;
       apiKeyInput.value = localStorage.getItem(keyStorageKey) || "";
       renderSessions();
       renderHistory();
@@ -79,8 +79,6 @@
       apiKeyInput.addEventListener("change", () => localStorage.setItem(keyStorageKey, apiKeyInput.value.trim()));
       sessionsSelect.addEventListener("change", () => {
         localStorage.setItem(activeSessionKey, sessionsSelect.value);
-        selectedContext = "";
-        selectionStatus.textContent = "尚未读取选区";
         promptInput.value = "";
         renderHistory();
       });
@@ -107,7 +105,7 @@
       });
       document.querySelector("#read-selection").addEventListener("click", () => {
         selectionStatus.textContent = "正在读取…";
-        window.parent.postMessage({ type: "read_selection" }, "*");
+        window.parent.postMessage({ type: "read_selection", requestId: crypto.randomUUID() }, "*");
       });
 
       button.addEventListener("click", async () => {
@@ -117,10 +115,17 @@
           status.textContent = "请填写 API Key 和设计描述。";
           return;
         }
-        const session = currentSession();
-        const userContent = selectedContext ? `${prompt}\n\nPenpot 当前选中内容（JSON）：\n${selectedContext}` : prompt;
-        const messages = [...session.messages.slice(-12), { role: "user", content: userContent }];
+        pendingSubmission = { requestId: crypto.randomUUID(), prompt, session: currentSession() };
         button.disabled = true;
+        status.textContent = "正在读取提交时的选区…";
+        selectionStatus.textContent = "正在读取提交时的选区…";
+        window.parent.postMessage({ type: "read_selection", requestId: pendingSubmission.requestId }, "*");
+      });
+
+      async function generateForSession(prompt, session, selection) {
+        const apiKey = apiKeyInput.value.trim();
+        const userContent = selection.length ? `${prompt}\n\nPenpot 当前选中内容（JSON）：\n${JSON.stringify(selection).slice(0, 12000)}` : prompt;
+        const messages = [...session.messages.slice(-12), { role: "user", content: userContent }];
         status.textContent = "正在请求 DeepSeek 并生成图层…";
         try {
           const width = Math.max(240, Math.min(3000, Number(widthInput.value) || 1440));
@@ -151,19 +156,25 @@
           status.textContent = error instanceof Error ? error.message : String(error);
           button.disabled = false;
         }
-      });
+      }
 
       window.addEventListener("message", (event) => {
         const message = event.data;
+        if (message?.type === "selection_update") {
+          updateSelection(message.selection, message.error);
+          return;
+        }
         if (message?.type === "selection_result") {
-          if (message.error) {
-            selectionStatus.textContent = `读取失败：${message.error}`;
-          } else if (!message.selection?.length) {
-            selectedContext = "";
-            selectionStatus.textContent = "当前没有选中图层";
-          } else {
-            selectedContext = JSON.stringify(message.selection).slice(0, 12000);
-            selectionStatus.textContent = `已读取 ${message.selection.length} 个选中图层，将随本次请求发送`;
+          updateSelection(message.selection, message.error);
+          if (pendingSubmission && message.requestId === pendingSubmission.requestId) {
+            const submission = pendingSubmission;
+            pendingSubmission = null;
+            if (message.error) {
+              status.textContent = `读取选区失败：${message.error}`;
+              button.disabled = false;
+            } else {
+              generateForSession(submission.prompt, submission.session, message.selection || []);
+            }
           }
           return;
         }
@@ -171,6 +182,22 @@
         status.textContent = message.ok ? "设计已创建。" : `创建失败：${message.error}`;
         button.disabled = false;
       });
+
+      function updateSelection(selection = [], error = "") {
+        if (error) {
+          selectionStatus.textContent = `读取失败：${error}`;
+          return;
+        }
+        if (!selection?.length) {
+          selectionStatus.textContent = "当前没有选中图层";
+          return;
+        }
+        const names = selection.slice(0, 3).map((shape) => shape.name || shape.type).join("、");
+        const more = selection.length > 3 ? ` 等 ${selection.length} 个图层` : `（${selection.length} 个）`;
+        selectionStatus.textContent = `选中：${names}${more}`;
+      }
+
+      window.parent.postMessage({ type: "plugin_ready" }, "*");
 
       function loadSessions() {
         try {
@@ -218,7 +245,7 @@
       }
 
       function systemPrompt(width) {
-        return `You are a design assistant that maintains a conversation and generates Penpot design trees. Use the full conversation history and any selected Penpot content included by the user as context. Respond with one JSON object only, no markdown. The root must be a FRAME with x:0,y:0,width:${width},height between 500 and 2400, name, fills, and children. Supported node types are FRAME, RECTANGLE, TEXT, SVG. Use absolute x/y coordinates local to the parent. Every visible element must have explicit dimensions and useful fills. Use this schema: {"type":"FRAME|RECTANGLE|TEXT|SVG","name":"string","x":0,"y":0,"width":100,"height":100,"fills":[{"type":"SOLID","color":{"r":255,"g":255,"b":255},"opacity":1}],"children":[],"characters":"text content","fontSize":16,"textAlignHorizontal":"LEFT|CENTER|RIGHT|JUSTIFIED","topLeftRadius":0,"topRightRadius":0,"bottomLeftRadius":0,"bottomRightRadius":0}. For TEXT, characters and fontSize are required. Use RGB channels from 0 to 255 and opacity from 0 to 1. Keep the layer tree under 100 nodes. For follow-up requests, revise the previous design according to the conversation. Create a polished, coherent interface with sensible spacing, typography, and contrast. Do not use SVG or IMAGE fills.`;
+        return `You are a design assistant that maintains a conversation and generates Penpot design trees. Use the full conversation history and any selected Penpot content included by the user as context. Respond with one JSON object only, no markdown. The root must be a FRAME with x:0,y:0,width:${width},height between 500 and 2400, name, fills, and children. Supported node types are FRAME, RECTANGLE, TEXT, SVG. Use absolute x/y coordinates local to the parent. Every visible element must have explicit dimensions and useful fills. Use this schema: {"type":"FRAME|RECTANGLE|TEXT|SVG","name":"string","x":0,"y":0,"width":100,"height":100,"fills":[{"type":"SOLID","color":{"r":255,"g":255,"b":255},"opacity":1}],"strokes":[{"color":{"r":30,"g":30,"b":30},"opacity":1,"strokeWidth":1}],"effects":[{"visible":true,"offset":{"x":0,"y":4},"spread_radius":0,"blur_radius":12,"color":{"r":0,"g":0,"b":0},"opacity":0.18}],"strokeWeight":1,"opacity":1,"children":[],"characters":"text content","fontFamily":"Inter","fontSize":16,"fontWeight":400,"fontStyle":"normal|italic","lineHeight":24,"letterSpacing":0,"textAlignHorizontal":"LEFT|CENTER|RIGHT|JUSTIFIED","topLeftRadius":0,"topRightRadius":0,"bottomLeftRadius":0,"bottomRightRadius":0}. For TEXT, characters and fontSize are required. Use RGB channels from 0 to 255 and opacity from 0 to 1. Add explicit solid fills to visible shapes and text, and use strokes/effects only when needed. Keep the layer tree under 100 nodes. For follow-up requests, revise the previous design according to the conversation. Create a polished, coherent interface with sensible spacing, typography, and contrast. Do not use SVG or IMAGE fills.`;
       }
 
       function validateTree(tree) {
