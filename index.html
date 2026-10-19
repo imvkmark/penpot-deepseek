@@ -8,7 +8,7 @@
       :root { color-scheme: light dark; font: 13px/1.5 Inter, system-ui, sans-serif; }
       * { box-sizing: border-box; }
       body { margin: 0; padding: 16px; color: var(--foreground-primary, #222); background: var(--background-primary, #fff); }
-      h1 { margin: 0 0 14px; font-size: 16px; }
+      h1 { margin: 0 0 10px; font-size: 16px; }
       label { display: block; margin: 12px 0 5px; font-weight: 600; }
       input, textarea, select { width: 100%; padding: 9px 10px; border: 1px solid #9995; border-radius: 6px; color: inherit; background: var(--background-secondary, #fff); font: inherit; }
       textarea { min-height: 150px; resize: vertical; }
@@ -18,13 +18,26 @@
       button:disabled { opacity: .6; cursor: wait; }
       #status { min-height: 22px; margin-top: 10px; overflow-wrap: anywhere; }
       .hint { margin: 6px 0 0; color: #888; font-size: 11px; }
+      .toolbar { display: flex; gap: 8px; align-items: center; }
+      .toolbar select { flex: 1; min-width: 0; }
+      .toolbar button, .secondary { width: auto; margin: 0; padding: 8px 10px; color: inherit; background: var(--background-secondary, #eee); border: 1px solid #9995; }
+      #selection { min-height: 0; margin-top: 8px; }
+      #history { max-height: 110px; overflow: auto; margin-top: 10px; padding: 8px; border: 1px solid #9994; border-radius: 6px; }
+      .turn { margin: 0 0 7px; white-space: pre-wrap; overflow-wrap: anywhere; }
+      .turn:last-child { margin-bottom: 0; }
+      .turn strong { color: #5367ff; }
     </style>
   </head>
   <body>
     <h1>DeepSeek Design Copilot</h1>
+    <div class="toolbar">
+      <select id="sessions" aria-label="会话"></select>
+      <button class="secondary" id="new-session" type="button">新会话</button>
+      <button class="secondary" id="delete-session" type="button">删除</button>
+    </div>
     <label for="api-key">DeepSeek API Key</label>
-    <input id="api-key" type="password" autocomplete="off" placeholder="sk-…" />
-    <p class="hint">Key 仅保存在此浏览器的 localStorage 中，并用于请求 DeepSeek API。</p>
+    <div class="toolbar"><input id="api-key" type="password" autocomplete="off" placeholder="sk-…" /><button class="secondary" id="save-key" type="button">保存</button></div>
+    <p class="hint">Key 保存在此浏览器本地。对话记录也保存在本地，不会同步到其他设备。</p>
     <div class="row">
       <div>
         <label for="model">模型</label>
@@ -37,7 +50,9 @@
     </div>
     <label for="prompt">描述你想生成的界面</label>
     <textarea id="prompt" placeholder="例如：一个简洁的 SaaS 数据分析仪表盘，左侧导航、顶部搜索栏、三张统计卡片和折线图。使用浅色主题。"></textarea>
-    <button id="generate">生成 Penpot 设计</button>
+    <div class="toolbar" style="margin-top:10px"><button class="secondary" id="read-selection" type="button">读取当前选区</button><span id="selection" class="hint">尚未读取选区</span></div>
+    <div id="history" aria-label="当前会话记录"></div>
+    <button id="generate">发送并生成设计</button>
     <div id="status" role="status" aria-live="polite"></div>
     <script>
       const apiKeyInput = document.querySelector("#api-key");
@@ -46,9 +61,54 @@
       const widthInput = document.querySelector("#width");
       const button = document.querySelector("#generate");
       const status = document.querySelector("#status");
-      const storageKey = "penpot-deepseek-api-key";
-      apiKeyInput.value = localStorage.getItem(storageKey) || "";
-      apiKeyInput.addEventListener("input", () => localStorage.setItem(storageKey, apiKeyInput.value.trim()));
+      const sessionsSelect = document.querySelector("#sessions");
+      const selectionStatus = document.querySelector("#selection");
+      const sessionsKey = "penpot-deepseek-sessions-v1";
+      const activeSessionKey = "penpot-deepseek-active-session-v1";
+      const keyStorageKey = "penpot-deepseek-api-key";
+      let sessions = loadSessions();
+      let selectedContext = "";
+      apiKeyInput.value = localStorage.getItem(keyStorageKey) || "";
+      renderSessions();
+      renderHistory();
+
+      document.querySelector("#save-key").addEventListener("click", () => {
+        localStorage.setItem(keyStorageKey, apiKeyInput.value.trim());
+        status.textContent = "API Key 已保存在此浏览器。";
+      });
+      apiKeyInput.addEventListener("change", () => localStorage.setItem(keyStorageKey, apiKeyInput.value.trim()));
+      sessionsSelect.addEventListener("change", () => {
+        localStorage.setItem(activeSessionKey, sessionsSelect.value);
+        selectedContext = "";
+        selectionStatus.textContent = "尚未读取选区";
+        promptInput.value = "";
+        renderHistory();
+      });
+      document.querySelector("#new-session").addEventListener("click", () => {
+        const session = { id: crypto.randomUUID(), title: "新会话", messages: [] };
+        sessions.unshift(session);
+        persistSessions();
+        renderSessions(session.id);
+        renderHistory();
+        promptInput.value = "";
+        status.textContent = "已创建新会话。";
+      });
+      document.querySelector("#delete-session").addEventListener("click", () => {
+        if (sessions.length <= 1) {
+          status.textContent = "至少保留一个会话。";
+          return;
+        }
+        sessions = sessions.filter((session) => session.id !== sessionsSelect.value);
+        persistSessions();
+        renderSessions(sessions[0].id);
+        renderHistory();
+        promptInput.value = "";
+        status.textContent = "会话已删除。";
+      });
+      document.querySelector("#read-selection").addEventListener("click", () => {
+        selectionStatus.textContent = "正在读取…";
+        window.parent.postMessage({ type: "read_selection" }, "*");
+      });
 
       button.addEventListener("click", async () => {
         const apiKey = apiKeyInput.value.trim();
@@ -57,6 +117,9 @@
           status.textContent = "请填写 API Key 和设计描述。";
           return;
         }
+        const session = currentSession();
+        const userContent = selectedContext ? `${prompt}\n\nPenpot 当前选中内容（JSON）：\n${selectedContext}` : prompt;
+        const messages = [...session.messages.slice(-12), { role: "user", content: userContent }];
         button.disabled = true;
         status.textContent = "正在请求 DeepSeek 并生成图层…";
         try {
@@ -68,10 +131,7 @@
               model: modelInput.value,
               stream: false,
               response_format: { type: "json_object" },
-              messages: [
-                { role: "system", content: systemPrompt(width) },
-                { role: "user", content: prompt },
-              ],
+              messages: [{ role: "system", content: systemPrompt(width) }, ...messages],
             }),
           });
           const payload = await response.json().catch(() => ({}));
@@ -80,6 +140,11 @@
           if (!content) throw new Error("DeepSeek 没有返回设计内容。");
           const tree = JSON.parse(content);
           validateTree(tree);
+          session.messages = [...messages, { role: "assistant", content }].slice(-40);
+          if (session.messages.length === 2 && session.title === "新会话") session.title = prompt.slice(0, 28) || "设计会话";
+          persistSessions();
+          renderSessions(session.id);
+          renderHistory();
           window.parent.postMessage({ type: "create_component", componentTree: tree }, "*");
           status.textContent = "已收到设计，正在写入 Penpot…";
         } catch (error) {
@@ -90,13 +155,70 @@
 
       window.addEventListener("message", (event) => {
         const message = event.data;
+        if (message?.type === "selection_result") {
+          if (message.error) {
+            selectionStatus.textContent = `读取失败：${message.error}`;
+          } else if (!message.selection?.length) {
+            selectedContext = "";
+            selectionStatus.textContent = "当前没有选中图层";
+          } else {
+            selectedContext = JSON.stringify(message.selection).slice(0, 12000);
+            selectionStatus.textContent = `已读取 ${message.selection.length} 个选中图层，将随本次请求发送`;
+          }
+          return;
+        }
         if (!message || message.type !== "generation_result") return;
         status.textContent = message.ok ? "设计已创建。" : `创建失败：${message.error}`;
         button.disabled = false;
       });
 
+      function loadSessions() {
+        try {
+          const saved = JSON.parse(localStorage.getItem(sessionsKey) || "[]");
+          if (Array.isArray(saved) && saved.length) return saved;
+        } catch {}
+        return [{ id: crypto.randomUUID(), title: "新会话", messages: [] }];
+      }
+
+      function currentSession() {
+        return sessions.find((session) => session.id === sessionsSelect.value) || sessions[0];
+      }
+
+      function persistSessions() {
+        localStorage.setItem(sessionsKey, JSON.stringify(sessions));
+      }
+
+      function renderSessions(selectedId = localStorage.getItem(activeSessionKey)) {
+        sessionsSelect.replaceChildren();
+        sessions.forEach((session) => {
+          const option = document.createElement("option");
+          option.value = session.id;
+          option.textContent = session.title || "未命名会话";
+          sessionsSelect.append(option);
+        });
+        const target = sessions.some((session) => session.id === selectedId) ? selectedId : sessions[0].id;
+        sessionsSelect.value = target;
+        localStorage.setItem(activeSessionKey, target);
+      }
+
+      function renderHistory() {
+        const history = document.querySelector("#history");
+        history.replaceChildren();
+        const messages = currentSession()?.messages || [];
+        for (const message of messages) {
+          const row = document.createElement("p");
+          row.className = "turn";
+          const label = document.createElement("strong");
+          label.textContent = message.role === "user" ? "你：" : "DeepSeek：";
+          const text = message.role === "assistant" ? "已生成设计，可继续提出修改要求。" : message.content.replace(/\n\nPenpot 当前选中内容（JSON）：[\s\S]*/, "（已附加 Penpot 选区）");
+          row.append(label, document.createTextNode(text));
+          history.append(row);
+        }
+        history.scrollTop = history.scrollHeight;
+      }
+
       function systemPrompt(width) {
-        return `You generate Penpot design trees. Output a single JSON object only, with no markdown. The root must be a FRAME with x:0,y:0,width:${width},height between 500 and 2400, name, fills, and children. Supported node types are FRAME, RECTANGLE, TEXT, SVG. Use absolute x/y coordinates local to the parent. Every visible element must have explicit dimensions and useful fills. Use this schema: {"type":"FRAME|RECTANGLE|TEXT|SVG","name":"string","x":0,"y":0,"width":100,"height":100,"fills":[{"type":"SOLID","color":{"r":255,"g":255,"b":255},"opacity":1}],"children":[],"characters":"text content","fontSize":16,"textAlignHorizontal":"LEFT|CENTER|RIGHT|JUSTIFIED","topLeftRadius":0,"topRightRadius":0,"bottomLeftRadius":0,"bottomRightRadius":0}. For TEXT, characters and fontSize are required. Use RGB channels from 0 to 255 and opacity from 0 to 1. Keep the layer tree under 100 nodes. Create a polished, coherent interface with sensible spacing, typography, and contrast. Do not use SVG or IMAGE fills.`;
+        return `You are a design assistant that maintains a conversation and generates Penpot design trees. Use the full conversation history and any selected Penpot content included by the user as context. Respond with one JSON object only, no markdown. The root must be a FRAME with x:0,y:0,width:${width},height between 500 and 2400, name, fills, and children. Supported node types are FRAME, RECTANGLE, TEXT, SVG. Use absolute x/y coordinates local to the parent. Every visible element must have explicit dimensions and useful fills. Use this schema: {"type":"FRAME|RECTANGLE|TEXT|SVG","name":"string","x":0,"y":0,"width":100,"height":100,"fills":[{"type":"SOLID","color":{"r":255,"g":255,"b":255},"opacity":1}],"children":[],"characters":"text content","fontSize":16,"textAlignHorizontal":"LEFT|CENTER|RIGHT|JUSTIFIED","topLeftRadius":0,"topRightRadius":0,"bottomLeftRadius":0,"bottomRightRadius":0}. For TEXT, characters and fontSize are required. Use RGB channels from 0 to 255 and opacity from 0 to 1. Keep the layer tree under 100 nodes. For follow-up requests, revise the previous design according to the conversation. Create a polished, coherent interface with sensible spacing, typography, and contrast. Do not use SVG or IMAGE fills.`;
       }
 
       function validateTree(tree) {

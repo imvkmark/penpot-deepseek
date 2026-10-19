@@ -5,6 +5,15 @@ penpot.ui.open("DeepSeek Design Copilot", "?theme=" + encodeURIComponent(penpot.
 
 penpot.ui.onMessage(async (event) => {
   const message = event.message;
+  if (message?.type === "read_selection") {
+    try {
+      const budget = { remaining: 200 };
+      penpot.ui.sendMessage({ type: "selection_result", selection: penpot.selection.slice(0, 20).map((shape) => serializeShape(shape, 0, budget)) });
+    } catch (error) {
+      penpot.ui.sendMessage({ type: "selection_result", error: error instanceof Error ? error.message : String(error) });
+    }
+    return;
+  }
   if (!message || message.type !== "create_component") return;
 
   try {
@@ -22,6 +31,28 @@ penpot.ui.onMessage(async (event) => {
     });
   }
 });
+
+function serializeShape(shape, depth = 0, budget = { remaining: 200 }) {
+  if (depth >= 8 || budget.remaining <= 0) return { type: shape.type, name: shape.name, truncated: true };
+  budget.remaining -= 1;
+  const result = {
+    id: shape.id,
+    type: shape.type,
+    name: shape.name,
+    x: shape.x,
+    y: shape.y,
+    width: shape.width,
+    height: shape.height,
+  };
+  if (shape.characters) result.text = String(shape.characters).slice(0, 2000);
+  if (Array.isArray(shape.fills)) result.fills = shape.fills.map((fill) => ({ color: fill.fillColor, opacity: fill.fillOpacity }));
+  if (Array.isArray(shape.strokes)) result.strokes = shape.strokes.map((stroke) => ({ color: stroke.strokeColor, width: stroke.strokeWidth }));
+  if (Array.isArray(shape.children) && shape.children.length) {
+    result.children = shape.children.slice(0, 50).map((child) => serializeShape(child, depth + 1, budget));
+    if (shape.children.length > 50 || budget.remaining <= 0) result.truncated = true;
+  }
+  return result;
+}
 
 async function createNode(spec, parent) {
   let node;

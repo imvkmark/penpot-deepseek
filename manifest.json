@@ -3,5 +3,5 @@
   "description": "Generate Penpot layouts from a text prompt with DeepSeek.",
   "version": 2,
   "code": "plugin.js",
-  "permissions": ["content:write"]
+  "permissions": ["content:read", "content:write"]
 }
